@@ -25,7 +25,7 @@ jobs:
         id: files
         run: |
           git fetch origin ${{ github.event.pull_request.base.ref }}
-          git diff --name-only -z origin/${{ github.event.pull_request.base.ref }}...HEAD | grep -z '\.js\|\.ts\|\.tsx\|\.py\|\.java\|\.css\|\.html\|\.md' > changed_files.txt || true
+          git diff --name-only -z origin/${{ github.event.pull_request.base.ref }}...HEAD | grep -z '\.js\|\.ts\|\.tsx\|\.py\|\.java\|\.css\|\.html\|\.md\|\.go\|\.rb\|\.rs\|\.c\|\.cpp\|\.h\|\.cs\|\.php\|\.kt\|\.swift\|\.scala\|\.sh\|\.yaml\|\.yml\|\.json\|\.xml\|\.sql' > changed_files.txt || true
           CHANGED_FILES=$(cat changed_files.txt | tr '\0' ',' | sed 's/,$//')
           echo "CHANGED_FILES=$CHANGED_FILES" >> $GITHUB_OUTPUT
 
