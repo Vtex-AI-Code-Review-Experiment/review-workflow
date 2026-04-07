@@ -1,0 +1,225 @@
+name: Reusable Gemini Code Review
+
+on:
+  workflow_call:
+    inputs:
+      usd_brl_rate:
+        description: 'Taxa de câmbio USD/BRL para cálculo de custo'
+        required: false
+        type: string
+        default: '5.16'
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: files
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git diff --name-only -z origin/${{ github.event.pull_request.base.ref }}...HEAD | grep -z '\.js\|\.ts\|\.tsx\|\.py\|\.java\|\.css\|\.html\|\.md' > changed_files.txt || true
+          CHANGED_FILES=$(cat changed_files.txt | tr '\0' ',' | sed 's/,$//')
+          echo "CHANGED_FILES=$CHANGED_FILES" >> $GITHUB_OUTPUT
+
+      - name: Read file contents
+        id: read
+        run: |
+          mkdir -p output
+          if [ ! -s changed_files.txt ]; then
+            echo "No changed files found" > output/combined.txt
+            echo "has_files=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_files=true" >> $GITHUB_OUTPUT
+            while IFS= read -r -d '' file; do
+              if [ -f "$file" ]; then
+                echo ">>>>> FILE: $file" >> output/combined.txt
+                cat "$file" >> output/combined.txt
+                echo -e "\n--- END OF FILE ---\n" >> output/combined.txt
+              fi
+            done < changed_files.txt
+          fi
+
+      - name: Create prompt file
+        if: steps.read.outputs.has_files == 'true'
+        run: |
+          cat > prompt.txt << 'PROMPT_EOF'
+          You are an autonomous code review agent acting as the first-line auditor before a human reviewer.
+
+          Goal:
+          - Reduce the human reviewer's workload by filtering for genuinely relevant defects.
+          - Focus on issues related to functionality, security, architecture, and code evolvability.
+          - Avoid purely cosmetic comments or feedback based only on personal preference.
+          - Produce a table that maps every detected occurrence to its error category.
+
+          Scope:
+          - Analyze the files and changed hunks in this pull request.
+          - Read surrounding context when needed to validate a finding, but keep the review centered on the PR diff.
+          - Treat each distinct occurrence as a separate finding. For example, if there are two logic defects, report two findings instead of merging them into one.
+          - Say explicitly the LLM model used on review.
+
+          Taxonomy:
+          Evolvability:
+          - Evolvability.Textual: Purely textual problems in the code. Examples: unclear names, obscure abbreviations, names that do not match behavior, missing comments where logic is complex, incorrect or outdated comments, or violations of naming and textual style conventions.
+          - Evolvability.SupportedByLanguage: Defects in language-supported self-documentation. Examples: poorly chosen access modifiers, missing or imprecise types when clearer typing is possible, or missing immutability where values should not change.
+          - Evolvability.VisualRepresentation: Visual representation problems in the way the code is shown on screen. Examples: inconsistent or confusing indentation, poor blank-line usage or grouping, or awkward alignment of parameters, blocks, and expressions. These do not change runtime behavior, but they slow reading and increase the chance of mistakes.
+          - Evolvability.Organizational: Problems in where functionality lives. Examples: responsibilities placed in the wrong module, classes or methods with too many responsibilities, dead code, or duplicated code that should be extracted to a common place.
+          - Evolvability.SolutionApproach: Problems in the chosen implementation approach. Examples: inappropriate data structures, reimplementing standard library behavior without justification, algorithms more complex than necessary, code with no useful effect, or semantic duplication.
+
+          Functional:
+          - Functional.Support: Defects in support tooling and infrastructure. Examples: incorrect build, deploy, or environment configuration, or use of the wrong version of external libraries. These issues may block compilation, execution, or cause environment-specific behavior.
+          - Functional.Timing: Concurrency and ordering defects. Examples: race conditions, deadlocks, ordering bugs, or memory visibility issues across threads or async flows.
+          - Functional.Logic: Incorrect behavior caused by wrong reasoning in the implementation. Examples: incorrect if/while conditions, mistakes in calculations, formulas, aggregations, conversions, or incorrect control flow that skips, reorders, or misses required handling.
+          - Functional.Check: Defects that increase the chance of failures or invalid data passing unnoticed. Examples: missing checks of fallible return values, missing or incorrect input validation, or incomplete verification before using a resource such as an array index, file handle, or nullable value.
+          - Functional.Resource: Defects involving allocation, initialization, use, reuse, or release of resources. Examples: memory leaks, failing to close files/connections/sockets, incorrect initialization of variables or data structures, or incorrect reuse of objects and buffers causing state corruption. These issues can cause failures, performance degradation, or unpredictable behavior.
+          - Functional.Interface: Incorrect use of internal or external interfaces. Examples: swapped parameters, wrong argument types, contract violations, or misuse of APIs.
+          - Functional.LargerDefect: A larger missing or incomplete behavior. Examples: an important requirement is not implemented, a key user flow is incomplete, or the change would require broader restructuring to be correct.
+
+          Other categories:
+          - FalsePositive: Use only when reviewing a previous finding or when code looks suspicious at first glance but is correct after deeper analysis and consistent with the codebase conventions.
+          - General: Use only if a relevant issue truly does not fit any category above.
+
+          Classification rules:
+          - Every finding must belong to exactly one category from the taxonomy above.
+          - Prefer the most specific category available.
+          - Use `General` only when no taxonomy category fits after careful analysis.
+          - Use `FalsePositive` only when it is clearly justified by the surrounding code and conventions.
+
+          Severity guide:
+          - `Block`: likely to cause incorrect behavior, security risk, data corruption, broken flows, or high-confidence regressions. Security issues are usually `Block`.
+          - `Flag`: important design, structure, or maintainability concern that should normally be addressed before merge, even if it is not an immediate runtime defect.
+          - `Suggest`: worthwhile improvement, but not strong enough on its own to block the PR.
+
+          Review task:
+          1. Analyze the PR and identify:
+             - logic or control-flow bugs
+             - missing validation or missing checks
+             - resource, interface, timing, and support issues
+             - evolvability issues related to textual clarity, language-supported documentation, visual representation, organization, and solution approach
+          2. Prevent quality regressions: if the diff removes important validations, tests, or checks without an adequate replacement, treat that as a relevant defect.
+          3. Treat security risks as high priority, including unsafe handling of user input, exposed secrets, or authentication/authorization bypasses.
+          4. Do not report low-value style-only comments unless they clearly map to the taxonomy and have practical review value.
+
+          Output format:
+          1. Start with an occurrence table with one row per finding:
+             - Columns: `ID | Category | Severity | File | Approx. line | Short description`
+             - Do not merge separate occurrences, even when they share the same category.
+          2. Then provide full details for each real finding using this format:
+             - Category: <Evolvability.Textual | Evolvability.Organizational | Functional.Logic | Functional.Check | ...>
+             - Severity: <Suggest | Flag | Block>
+             - File: path/to/file.ext
+             - Approx. line: X
+             - Description: short, objective, technical description. Start the sentence with the same category in brackets, for example: `[Functional.Logic] incorrect loop exit condition`.
+             - Suggestion: how to fix or improve the issue.
+
+          Final summary:
+          - PR risk: Low | Medium | High
+          - Main defect categories found
+          - List of blocking items
+          - If there are no relevant findings, output exactly:
+            "No relevant issues found in this PR. PR risk: Low."
+
+          Code:
+          PROMPT_EOF
+
+      - name: Estimate input tokens
+        id: estimate
+        if: steps.read.outputs.has_files == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          jq -n \
+            --rawfile prompt prompt.txt \
+            --rawfile code output/combined.txt \
+            '{
+              "contents": [{
+                "parts": [{
+                  "text": ($prompt + "\n\n" + $code)
+                }]
+              }]
+            }' > request.json
+
+          COUNT_RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:countTokens?key=${GEMINI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @request.json)
+
+          ESTIMATED_INPUT=$(echo "$COUNT_RESPONSE" | jq -r '.totalTokens // "N/A"')
+          echo "ESTIMATED_INPUT=$ESTIMATED_INPUT" >> $GITHUB_OUTPUT
+
+      - name: Send to Gemini API
+        id: gemini
+        if: steps.read.outputs.has_files == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          USD_BRL_RATE: ${{ inputs.usd_brl_rate }}
+        run: |
+          RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @request.json)
+
+          REVIEW_TEXT=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "Erro: Não foi possível processar a resposta da IA."')
+          
+          INPUT_TOKENS=$(echo "$RESPONSE" | jq -r '.usageMetadata.promptTokenCount // 0')
+          THINKING_TOKENS=$(echo "$RESPONSE" | jq -r '.usageMetadata.thoughtsTokenCount // 0')
+          OUTPUT_TOKENS=$(echo "$RESPONSE" | jq -r '.usageMetadata.candidatesTokenCount // 0')
+          TOTAL_TOKENS=$(echo "$RESPONSE" | jq -r '.usageMetadata.totalTokenCount // 0')
+
+          # Preços Gemini 2.5 Flash por 1M tokens (USD)
+          INPUT_PRICE=0.15
+          THINKING_PRICE=3.50
+          OUTPUT_PRICE=0.60
+
+          # Calcular custos em USD
+          INPUT_COST_USD=$(echo "scale=6; $INPUT_TOKENS * $INPUT_PRICE / 1000000" | bc)
+          THINKING_COST_USD=$(echo "scale=6; $THINKING_TOKENS * $THINKING_PRICE / 1000000" | bc)
+          OUTPUT_COST_USD=$(echo "scale=6; $OUTPUT_TOKENS * $OUTPUT_PRICE / 1000000" | bc)
+          TOTAL_COST_USD=$(echo "scale=6; $INPUT_COST_USD + $THINKING_COST_USD + $OUTPUT_COST_USD" | bc)
+
+          # Calcular custos em BRL
+          INPUT_COST_BRL=$(echo "scale=4; $INPUT_COST_USD * $USD_BRL_RATE" | bc)
+          THINKING_COST_BRL=$(echo "scale=4; $THINKING_COST_USD * $USD_BRL_RATE" | bc)
+          OUTPUT_COST_BRL=$(echo "scale=4; $OUTPUT_COST_USD * $USD_BRL_RATE" | bc)
+          TOTAL_COST_BRL=$(echo "scale=4; $TOTAL_COST_USD * $USD_BRL_RATE" | bc)
+
+          echo "REVIEW<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW_TEXT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "INPUT_TOKENS=$INPUT_TOKENS" >> $GITHUB_OUTPUT
+          echo "THINKING_TOKENS=$THINKING_TOKENS" >> $GITHUB_OUTPUT
+          echo "OUTPUT_TOKENS=$OUTPUT_TOKENS" >> $GITHUB_OUTPUT
+          echo "TOTAL_TOKENS=$TOTAL_TOKENS" >> $GITHUB_OUTPUT
+          echo "INPUT_COST_USD=$INPUT_COST_USD" >> $GITHUB_OUTPUT
+          echo "THINKING_COST_USD=$THINKING_COST_USD" >> $GITHUB_OUTPUT
+          echo "OUTPUT_COST_USD=$OUTPUT_COST_USD" >> $GITHUB_OUTPUT
+          echo "TOTAL_COST_USD=$TOTAL_COST_USD" >> $GITHUB_OUTPUT
+          echo "INPUT_COST_BRL=$INPUT_COST_BRL" >> $GITHUB_OUTPUT
+          echo "THINKING_COST_BRL=$THINKING_COST_BRL" >> $GITHUB_OUTPUT
+          echo "OUTPUT_COST_BRL=$OUTPUT_COST_BRL" >> $GITHUB_OUTPUT
+          echo "TOTAL_COST_BRL=$TOTAL_COST_BRL" >> $GITHUB_OUTPUT
+          echo "USD_BRL_RATE=$USD_BRL_RATE" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR
+        if: steps.read.outputs.has_files == 'true'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ github.token }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## Gemini 2.5 Flash Code Review
+            ${{ steps.gemini.outputs.REVIEW }}
+            
+            ---
+            **Token Usage & Cost** (USD/BRL rate: ${{ steps.gemini.outputs.USD_BRL_RATE }})
+            | Metric | Tokens | Cost (USD) | Cost (BRL) |
+            |--------|-------:|------------|------------|
+            | Input | `${{ steps.gemini.outputs.INPUT_TOKENS }}` | $`${{ steps.gemini.outputs.INPUT_COST_USD }}` | R$ `${{ steps.gemini.outputs.INPUT_COST_BRL }}` |
+            | Thinking | `${{ steps.gemini.outputs.THINKING_TOKENS }}` | $`${{ steps.gemini.outputs.THINKING_COST_USD }}` | R$ `${{ steps.gemini.outputs.THINKING_COST_BRL }}` |
+            | Output | `${{ steps.gemini.outputs.OUTPUT_TOKENS }}` | $`${{ steps.gemini.outputs.OUTPUT_COST_USD }}` | R$ `${{ steps.gemini.outputs.OUTPUT_COST_BRL }}` |
+            | **Total** | `${{ steps.gemini.outputs.TOTAL_TOKENS }}` | **$`${{ steps.gemini.outputs.TOTAL_COST_USD }}`** | **R$ `${{ steps.gemini.outputs.TOTAL_COST_BRL }}`** |
