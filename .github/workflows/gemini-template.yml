@@ -21,34 +21,42 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get changed files
+      - name: Get changed files and diff
         id: files
         run: |
           git fetch origin ${{ github.event.pull_request.base.ref }}
-          git diff --name-only -z origin/${{ github.event.pull_request.base.ref }}...HEAD | grep -z '\.js\|\.ts\|\.tsx\|\.py\|\.java\|\.css\|\.html\|\.md\|\.go\|\.rb\|\.rs\|\.c\|\.cpp\|\.h\|\.cs\|\.php\|\.kt\|\.swift\|\.scala\|\.sh\|\.yaml\|\.yml\|\.json\|\.xml\|\.sql' > changed_files.txt || true
-          CHANGED_FILES=$(cat changed_files.txt | tr '\0' ',' | sed 's/,$//')
-          echo "CHANGED_FILES=$CHANGED_FILES" >> $GITHUB_OUTPUT
-
-      - name: Read file contents
-        id: read
-        run: |
-          mkdir -p output
+          
+          # Get list of changed files, excluding binaries and lock files
+          git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD | \
+            grep -vE '\.(png|jpg|jpeg|gif|ico|svg|webp|bmp|woff|woff2|ttf|eot|otf|pdf|zip|tar|gz|rar|7z|exe|dll|so|dylib|bin|lock)$' | \
+            grep -vE '(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|composer\.lock|Gemfile\.lock|poetry\.lock)$' > changed_files.txt || true
+          
           if [ ! -s changed_files.txt ]; then
-            echo "No changed files found" > output/combined.txt
             echo "has_files=false" >> $GITHUB_OUTPUT
-          else
-            echo "has_files=true" >> $GITHUB_OUTPUT
-            while IFS= read -r -d '' file; do
-              if [ -f "$file" ]; then
-                echo ">>>>> FILE: $file" >> output/combined.txt
-                cat "$file" >> output/combined.txt
-                echo -e "\n--- END OF FILE ---\n" >> output/combined.txt
-              fi
-            done < changed_files.txt
+            exit 0
           fi
+          
+          echo "has_files=true" >> $GITHUB_OUTPUT
+          
+          # Get the unified diff with line numbers for context
+          git diff origin/${{ github.event.pull_request.base.ref }}...HEAD -- $(cat changed_files.txt | tr '\n' ' ') > diff.patch
+          
+          # Create a file with full content + line numbers for each changed file
+          mkdir -p output
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              echo "===== FILE: $file =====" >> output/combined.txt
+              cat -n "$file" >> output/combined.txt
+              echo -e "\n" >> output/combined.txt
+            fi
+          done < changed_files.txt
+          
+          # Also include the diff for context on what changed
+          echo "\n===== GIT DIFF =====" >> output/combined.txt
+          cat diff.patch >> output/combined.txt
 
       - name: Create prompt file
-        if: steps.read.outputs.has_files == 'true'
+        if: steps.files.outputs.has_files == 'true'
         run: |
           cat > prompt.txt << 'PROMPT_EOF'
           You are an autonomous code review agent acting as the first-line auditor before a human reviewer.
@@ -99,39 +107,39 @@ jobs:
 
           Review task:
           1. Analyze the PR and identify:
-             - logic or control-flow bugs
-             - missing validation or missing checks
-             - resource, interface, timing, and support issues
-             - evolvability issues related to textual clarity, language-supported documentation, visual representation, organization, and solution approach
+          - logic or control-flow bugs
+          - missing validation or missing checks
+          - resource, interface, timing, and support issues
+          - evolvability issues related to textual clarity, language-supported documentation, visual representation, organization, and solution approach
           2. Prevent quality regressions: if the diff removes important validations, tests, or checks without an adequate replacement, treat that as a relevant defect.
           3. Treat security risks as high priority, including unsafe handling of user input, exposed secrets, or authentication/authorization bypasses.
           4. Do not report low-value style-only comments unless they clearly map to the taxonomy and have practical review value.
 
           Output format:
           1. Start with an occurrence table with one row per finding:
-             - Columns: `ID | Category | Severity | File | Approx. line | Short description`
-             - Do not merge separate occurrences, even when they share the same category.
+          - Columns: `ID | Category | Severity | File | Approx. line | Short description` 
+          - Do not merge separate occurrences, even when they share the same category.
           2. Then provide full details for each real finding using this format:
-             - Category: <Evolvability.Textual | Evolvability.Organizational | Functional.Logic | Functional.Check | ...>
-             - Severity: <Suggest | Flag | Block>
-             - File: path/to/file.ext
-             - Approx. line: X
-             - Description: short, objective, technical description. Start the sentence with the same category in brackets, for example: `[Functional.Logic] incorrect loop exit condition`.
-             - Suggestion: how to fix or improve the issue.
+          - Category: <Evolvability.Textual | Evolvability.Organizational | Functional.Logic | Functional.Check | ...>
+          - Severity: <Suggest | Flag | Block>
+          - File: path/to/file.ext
+          - Approx. line: X
+          - Description: short, objective, technical description. Start the sentence with the same category in brackets, for example: `[Functional.Logic] incorrect loop exit condition`.
+          - Suggestion: how to fix or improve the issue.
 
           Final summary:
           - PR risk: Low | Medium | High
           - Main defect categories found
           - List of blocking items
           - If there are no relevant findings, output exactly:
-            "No relevant issues found in this PR. PR risk: Low."
+          "No relevant issues found in this PR. PR risk: Low."
 
-          Code:
+          Code to review:
           PROMPT_EOF
 
       - name: Estimate input tokens
         id: estimate
-        if: steps.read.outputs.has_files == 'true'
+        if: steps.files.outputs.has_files == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -155,7 +163,7 @@ jobs:
 
       - name: Send to Gemini API
         id: gemini
-        if: steps.read.outputs.has_files == 'true'
+        if: steps.files.outputs.has_files == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           USD_BRL_RATE: ${{ inputs.usd_brl_rate }}
@@ -205,21 +213,104 @@ jobs:
           echo "TOTAL_COST_BRL=$TOTAL_COST_BRL" >> $GITHUB_OUTPUT
           echo "USD_BRL_RATE=$USD_BRL_RATE" >> $GITHUB_OUTPUT
 
+      - name: Parse table and create inline comments
+        if: steps.files.outputs.has_files == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Save review text to file for parsing
+          cat << 'REVIEW_EOF' > review_output.txt
+          ${{ steps.gemini.outputs.REVIEW }}
+          REVIEW_EOF
+          
+          # Extract table rows (lines with | that have file paths)
+          # Format: | ID | Category | Severity | File | Approx. line | Short description |
+          COMMENTS_JSON="[]"
+          
+          while IFS= read -r line; do
+            # Skip header and separator lines
+            if echo "$line" | grep -qE '^\|.*\|.*\|.*\|.*\|.*\|' && \
+               ! echo "$line" | grep -qE '^\|[\s-]*ID' && \
+               ! echo "$line" | grep -qE '^\|[\s-]*-+'; then
+              
+              # Parse the table row
+              ID=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
+              CATEGORY=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $3); print $3}')
+              SEVERITY=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $4); print $4}')
+              FILE=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $5); print $5}')
+              LINE_NUM=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $6); print $6}')
+              DESC=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $7); print $7}')
+              
+              # Validate extracted data
+              if [ -n "$FILE" ] && [ -n "$LINE_NUM" ] && echo "$LINE_NUM" | grep -qE '^[0-9]+$'; then
+                # Build comment body
+                BODY="**[$CATEGORY]** $SEVERITY: $DESC"
+                
+                # Add to JSON array
+                COMMENTS_JSON=$(echo "$COMMENTS_JSON" | jq \
+                  --arg path "$FILE" \
+                  --argjson line "$LINE_NUM" \
+                  --arg body "$BODY" \
+                  '. += [{"path": $path, "line": $line, "body": $body}]')
+                
+                echo "Parsed: $FILE:$LINE_NUM - $CATEGORY"
+              fi
+            fi
+          done < review_output.txt
+          
+          COMMENT_COUNT=$(echo "$COMMENTS_JSON" | jq 'length')
+          echo "Found $COMMENT_COUNT inline comments to create"
+          
+          if [ "$COMMENT_COUNT" -gt 0 ]; then
+            # Get PR info
+            PR_NUMBER=${{ github.event.pull_request.number }}
+            REPO=${{ github.repository }}
+            COMMIT_SHA=${{ github.event.pull_request.head.sha }}
+            
+            # Create the review via GitHub API
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews" \
+              -d "$(jq -n \
+                --arg sha "$COMMIT_SHA" \
+                --arg body " **Gemini AI Code Review** - $COMMENT_COUNT findings. See inline comments below." \
+                --argjson comments "$COMMENTS_JSON" \
+                '{commit_id: $sha, body: $body, event: "COMMENT", comments: $comments}')")
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+              echo "Successfully created review with $COMMENT_COUNT inline comments"
+            else
+              echo "Failed to create review (HTTP $HTTP_CODE): $BODY"
+              echo "Comments JSON: $COMMENTS_JSON"
+            fi
+          else
+            echo "No inline comments to create (no table rows found or parsing failed)"
+          fi
+
       - name: Comment on PR
-        if: steps.read.outputs.has_files == 'true'
+        if: steps.files.outputs.has_files == 'true'
         uses: peter-evans/create-or-update-comment@v4
         with:
           token: ${{ github.token }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
             ## Gemini 2.5 Flash Code Review
+            
             ${{ steps.gemini.outputs.REVIEW }}
             
             ---
-            **Token Usage & Cost** (USD/BRL rate: ${{ steps.gemini.outputs.USD_BRL_RATE }})
+            <details>
+            <summary> Token Usage & Cost (USD/BRL rate: ${{ steps.gemini.outputs.USD_BRL_RATE }})</summary>
+            
             | Metric | Tokens | Cost (USD) | Cost (BRL) |
             |--------|-------:|------------|------------|
-            | Input | `${{ steps.gemini.outputs.INPUT_TOKENS }}` | $`${{ steps.gemini.outputs.INPUT_COST_USD }}` | R$ `${{ steps.gemini.outputs.INPUT_COST_BRL }}` |
-            | Thinking | `${{ steps.gemini.outputs.THINKING_TOKENS }}` | $`${{ steps.gemini.outputs.THINKING_COST_USD }}` | R$ `${{ steps.gemini.outputs.THINKING_COST_BRL }}` |
-            | Output | `${{ steps.gemini.outputs.OUTPUT_TOKENS }}` | $`${{ steps.gemini.outputs.OUTPUT_COST_USD }}` | R$ `${{ steps.gemini.outputs.OUTPUT_COST_BRL }}` |
-            | **Total** | `${{ steps.gemini.outputs.TOTAL_TOKENS }}` | **$`${{ steps.gemini.outputs.TOTAL_COST_USD }}`** | **R$ `${{ steps.gemini.outputs.TOTAL_COST_BRL }}`** |
+            | Input | ${{ steps.gemini.outputs.INPUT_TOKENS }} | ${{ steps.gemini.outputs.INPUT_COST_USD }} | R$ ${{ steps.gemini.outputs.INPUT_COST_BRL }} |
+            | Thinking | ${{ steps.gemini.outputs.THINKING_TOKENS }} | ${{ steps.gemini.outputs.THINKING_COST_USD }} | R$ ${{ steps.gemini.outputs.THINKING_COST_BRL }} |
+            | Output | ${{ steps.gemini.outputs.OUTPUT_TOKENS }} | ${{ steps.gemini.outputs.OUTPUT_COST_USD }} | R$ ${{ steps.gemini.outputs.OUTPUT_COST_BRL }} |
+            | **Total** | ${{ steps.gemini.outputs.TOTAL_TOKENS }} | **${{ steps.gemini.outputs.TOTAL_COST_USD }}** | **R$ ${{ steps.gemini.outputs.TOTAL_COST_BRL }}** |
+            
+            </details>
