@@ -50,8 +50,12 @@ jobs:
           # Create a file with full content + line numbers for each changed file
           mkdir -p output
           
-          # Include PR metadata for better context
+          # Include PR metadata and model info for better context
           cat >> output/combined.txt << METADATA_EOF
+          ===== REVIEW METADATA =====
+          LLM Model: Gemini 2.5 Flash
+          ===========================
+          
           ===== PULL REQUEST METADATA =====
           Title: ${PR_TITLE}
           Author: ${PR_AUTHOR}
