@@ -23,6 +23,12 @@ jobs:
 
       - name: Get changed files and diff
         id: files
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
         run: |
           git fetch origin ${{ github.event.pull_request.base.ref }}
           
@@ -43,6 +49,19 @@ jobs:
           
           # Create a file with full content + line numbers for each changed file
           mkdir -p output
+          
+          # Include PR metadata for better context
+          cat >> output/combined.txt << METADATA_EOF
+          ===== PULL REQUEST METADATA =====
+          Title: ${PR_TITLE}
+          Author: ${PR_AUTHOR}
+          Branch: ${PR_HEAD} -> ${PR_BASE}
+          Description:
+          ${PR_BODY:-No description provided.}
+          =================================
+          
+          METADATA_EOF
+          
           while IFS= read -r file; do
             if [ -f "$file" ]; then
               echo "===== FILE: $file =====" >> output/combined.txt
@@ -54,6 +73,18 @@ jobs:
           # Also include the diff for context on what changed
           echo "\n===== GIT DIFF =====" >> output/combined.txt
           cat diff.patch >> output/combined.txt
+          
+          # Protection: check combined file size (rough token estimate: 1 char ~ 0.25 tokens)
+          FILE_SIZE=$(wc -c < output/combined.txt)
+          ESTIMATED_TOKENS=$((FILE_SIZE / 4))
+          echo "Estimated input size: $FILE_SIZE bytes (~$ESTIMATED_TOKENS tokens)"
+          
+          # Gemini 2.5 Flash context window is 1M tokens; warn if PR is very large
+          if [ "$ESTIMATED_TOKENS" -gt 900000 ]; then
+            echo "::warning::PR is very large (~$ESTIMATED_TOKENS tokens). Review may be truncated or fail."
+          fi
+          
+          echo "ESTIMATED_SIZE=$ESTIMATED_TOKENS" >> $GITHUB_OUTPUT
 
       - name: Create prompt file
         if: steps.files.outputs.has_files == 'true'
@@ -137,21 +168,41 @@ jobs:
           Code to review:
           PROMPT_EOF
 
-      - name: Estimate input tokens
+      - name: Build request and estimate tokens
         id: estimate
         if: steps.files.outputs.has_files == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
+          # Build request with systemInstruction separated from contents
+          # This gives higher priority to the prompt instructions
           jq -n \
             --rawfile prompt prompt.txt \
             --rawfile code output/combined.txt \
             '{
+              "systemInstruction": {
+                "parts": [{
+                  "text": $prompt
+                }]
+              },
               "contents": [{
                 "parts": [{
-                  "text": ($prompt + "\n\n" + $code)
+                  "text": $code
                 }]
-              }]
+              }],
+              "generationConfig": {
+                "temperature": 1.0,
+                "maxOutputTokens": 65536,
+                "thinkingConfig": {
+                  "thinkingBudget": 16384
+                }
+              },
+              "safetySettings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}
+              ]
             }' > request.json
 
           COUNT_RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:countTokens?key=${GEMINI_API_KEY}" \
@@ -160,6 +211,7 @@ jobs:
 
           ESTIMATED_INPUT=$(echo "$COUNT_RESPONSE" | jq -r '.totalTokens // "N/A"')
           echo "ESTIMATED_INPUT=$ESTIMATED_INPUT" >> $GITHUB_OUTPUT
+          echo "Estimated input tokens: $ESTIMATED_INPUT"
 
       - name: Send to Gemini API
         id: gemini
@@ -168,9 +220,40 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           USD_BRL_RATE: ${{ inputs.usd_brl_rate }}
         run: |
-          RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d @request.json)
+          # Retry with exponential backoff (3 attempts)
+          MAX_RETRIES=3
+          RETRY_DELAY=5
+          RESPONSE=""
+          
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $attempt/$MAX_RETRIES..."
+            
+            HTTP_RESULT=$(curl -s -w "\n%{http_code}" -X POST \
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d @request.json)
+            
+            HTTP_CODE=$(echo "$HTTP_RESULT" | tail -n1)
+            RESPONSE=$(echo "$HTTP_RESULT" | sed '$d')
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "API call succeeded (HTTP 200)"
+              break
+            fi
+            
+            echo "API returned HTTP $HTTP_CODE"
+            
+            if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+              if [ "$HTTP_CODE" = "429" ] || [ "$HTTP_CODE" = "500" ] || [ "$HTTP_CODE" = "503" ]; then
+                echo "Retryable error. Waiting ${RETRY_DELAY}s before retry..."
+                sleep $RETRY_DELAY
+                RETRY_DELAY=$((RETRY_DELAY * 2))
+              else
+                echo "Non-retryable error. Aborting."
+                break
+              fi
+            fi
+          done
 
           REVIEW_TEXT=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "Erro: Não foi possível processar a resposta da IA."')
           
@@ -223,46 +306,66 @@ jobs:
           ${{ steps.gemini.outputs.REVIEW }}
           REVIEW_EOF
           
-          # Extract table rows (lines with | that have file paths)
+          # Robust parser for the occurrence table
           # Format: | ID | Category | Severity | File | Approx. line | Short description |
+          # Handles: leading/trailing spaces, backticks in cells, markdown formatting
           COMMENTS_JSON="[]"
+          PARSED_COUNT=0
+          SKIPPED_COUNT=0
           
           while IFS= read -r line; do
-            # Skip header and separator lines
-            if echo "$line" | grep -qE '^\|.*\|.*\|.*\|.*\|.*\|' && \
-               ! echo "$line" | grep -qE '^\|[\s-]*ID' && \
-               ! echo "$line" | grep -qE '^\|[\s-]*-+'; then
+            # Strip leading/trailing whitespace
+            line=$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+            
+            # Must contain at least 6 pipe characters (7 columns) to be a data row
+            PIPE_COUNT=$(echo "$line" | tr -cd '|' | wc -c)
+            if [ "$PIPE_COUNT" -lt 6 ]; then
+              continue
+            fi
+            
+            # Skip header rows (contain "ID" or "Category" as column names)
+            if echo "$line" | grep -qiE '\|\s*(ID|Category|Severity)\s*\|'; then
+              continue
+            fi
+            
+            # Skip separator rows (contain only pipes, dashes, spaces, colons)
+            if echo "$line" | grep -qE '^\|[\s:|-]+\|$'; then
+              continue
+            fi
+            
+            # Parse the table row - strip backticks and extra formatting
+            ID=$(echo "$line" | awk -F'|' '{gsub(/^[ \t`]+|[ \t`]+$/, "", $2); print $2}')
+            CATEGORY=$(echo "$line" | awk -F'|' '{gsub(/^[ \t`*]+|[ \t`*]+$/, "", $3); print $3}')
+            SEVERITY=$(echo "$line" | awk -F'|' '{gsub(/^[ \t`*]+|[ \t`*]+$/, "", $4); print $4}')
+            FILE=$(echo "$line" | awk -F'|' '{gsub(/^[ \t`]+|[ \t`]+$/, "", $5); print $5}')
+            LINE_NUM=$(echo "$line" | awk -F'|' '{gsub(/^[ \t`~]+|[ \t`~]+$/, "", $6); gsub(/[^0-9]/, "", $6); print $6}')
+            DESC=$(echo "$line" | awk -F'|' '{gsub(/^[ \t`]+|[ \t`]+$/, "", $7); print $7}')
+            
+            # Validate: file must exist in diff, line must be a number
+            if [ -n "$FILE" ] && [ -n "$LINE_NUM" ] && [ "$LINE_NUM" -gt 0 ] 2>/dev/null; then
+              BODY="**[$CATEGORY]** $SEVERITY: $DESC"
               
-              # Parse the table row
-              ID=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
-              CATEGORY=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $3); print $3}')
-              SEVERITY=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $4); print $4}')
-              FILE=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $5); print $5}')
-              LINE_NUM=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $6); print $6}')
-              DESC=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $7); print $7}')
+              # Add to JSON array using jq for safe escaping
+              COMMENTS_JSON=$(echo "$COMMENTS_JSON" | jq \
+                --arg path "$FILE" \
+                --argjson line "$LINE_NUM" \
+                --arg body "$BODY" \
+                '. += [{"path": $path, "line": $line, "body": $body}]')
               
-              # Validate extracted data
-              if [ -n "$FILE" ] && [ -n "$LINE_NUM" ] && echo "$LINE_NUM" | grep -qE '^[0-9]+$'; then
-                # Build comment body
-                BODY="**[$CATEGORY]** $SEVERITY: $DESC"
-                
-                # Add to JSON array
-                COMMENTS_JSON=$(echo "$COMMENTS_JSON" | jq \
-                  --arg path "$FILE" \
-                  --argjson line "$LINE_NUM" \
-                  --arg body "$BODY" \
-                  '. += [{"path": $path, "line": $line, "body": $body}]')
-                
-                echo "Parsed: $FILE:$LINE_NUM - $CATEGORY"
-              fi
+              PARSED_COUNT=$((PARSED_COUNT + 1))
+              echo "  [$PARSED_COUNT] $FILE:$LINE_NUM ($SEVERITY) - $CATEGORY"
+            else
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              echo "  [SKIP] Could not parse row: $line"
             fi
           done < review_output.txt
           
           COMMENT_COUNT=$(echo "$COMMENTS_JSON" | jq 'length')
-          echo "Found $COMMENT_COUNT inline comments to create"
+          echo ""
+          echo "=== Parser Summary ==="
+          echo "Parsed: $PARSED_COUNT | Skipped: $SKIPPED_COUNT | Total comments: $COMMENT_COUNT"
           
           if [ "$COMMENT_COUNT" -gt 0 ]; then
-            # Get PR info
             PR_NUMBER=${{ github.event.pull_request.number }}
             REPO=${{ github.repository }}
             COMMIT_SHA=${{ github.event.pull_request.head.sha }}
@@ -274,21 +377,49 @@ jobs:
               "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/reviews" \
               -d "$(jq -n \
                 --arg sha "$COMMIT_SHA" \
-                --arg body " **Gemini AI Code Review** - $COMMENT_COUNT findings. See inline comments below." \
+                --arg body "**Gemini AI Code Review** - $COMMENT_COUNT findings. See inline comments below." \
                 --argjson comments "$COMMENTS_JSON" \
                 '{commit_id: $sha, body: $body, event: "COMMENT", comments: $comments}')")
             
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-            BODY=$(echo "$RESPONSE" | sed '$d')
+            RESP_BODY=$(echo "$RESPONSE" | sed '$d')
             
             if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
               echo "Successfully created review with $COMMENT_COUNT inline comments"
             else
-              echo "Failed to create review (HTTP $HTTP_CODE): $BODY"
-              echo "Comments JSON: $COMMENTS_JSON"
+              echo "Failed to create review (HTTP $HTTP_CODE)"
+              echo "Response: $RESP_BODY"
+              
+              # Fallback: try posting comments one by one if batch fails
+              echo "Attempting individual comments as fallback..."
+              SUCCESS=0
+              for i in $(seq 0 $((COMMENT_COUNT - 1))); do
+                COMMENT=$(echo "$COMMENTS_JSON" | jq -c ".[$i]")
+                C_PATH=$(echo "$COMMENT" | jq -r '.path')
+                C_LINE=$(echo "$COMMENT" | jq -r '.line')
+                C_BODY=$(echo "$COMMENT" | jq -r '.body')
+                
+                SINGLE_RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/comments" \
+                  -d "$(jq -n \
+                    --arg sha "$COMMIT_SHA" \
+                    --arg path "$C_PATH" \
+                    --argjson line "$C_LINE" \
+                    --arg body "$C_BODY" \
+                    '{commit_id: $sha, path: $path, line: $line, body: $body}')")
+                
+                if [ "$SINGLE_RESP" = "201" ]; then
+                  SUCCESS=$((SUCCESS + 1))
+                else
+                  echo "  Failed comment on $C_PATH:$C_LINE (HTTP $SINGLE_RESP)"
+                fi
+              done
+              echo "Fallback: $SUCCESS/$COMMENT_COUNT comments posted individually"
             fi
           else
-            echo "No inline comments to create (no table rows found or parsing failed)"
+            echo "No inline comments to create (no table rows parsed)"
           fi
 
       - name: Comment on PR
