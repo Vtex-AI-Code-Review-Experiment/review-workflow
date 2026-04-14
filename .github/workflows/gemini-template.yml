@@ -296,6 +296,66 @@ jobs:
           echo "TOTAL_COST_BRL=$TOTAL_COST_BRL" >> $GITHUB_OUTPUT
           echo "USD_BRL_RATE=$USD_BRL_RATE" >> $GITHUB_OUTPUT
 
+      - name: Build diff line map
+        id: diffmap
+        if: steps.files.outputs.has_files == 'true'
+        run: |
+          # Parse the git diff to extract valid line ranges per file
+          # This creates a JSON map: { "file.ext": [10, 11, 12, 15, 16, ...], ... }
+          # containing all line numbers (in the new file) that are part of the diff
+          
+          DIFF_MAP='{}'
+          CURRENT_FILE=""
+          NEW_LINE=0
+          
+          while IFS= read -r line; do
+            # Detect file header: +++ b/path/to/file
+            if echo "$line" | grep -qE '^\+\+\+ b/'; then
+              CURRENT_FILE=$(echo "$line" | sed 's/^+++ b\///')
+              # Initialize empty array for this file if not exists
+              DIFF_MAP=$(echo "$DIFF_MAP" | jq --arg f "$CURRENT_FILE" 'if .[$f] then . else . + {($f): []} end')
+              continue
+            fi
+            
+            # Detect hunk header: @@ -old,count +new,count @@
+            if echo "$line" | grep -qE '^@@ '; then
+              # Extract the new file start line
+              NEW_LINE=$(echo "$line" | grep -oP '\+\K[0-9]+' | head -1)
+              # Subtract 1 because we increment before processing
+              NEW_LINE=$((NEW_LINE - 1))
+              continue
+            fi
+            
+            # Skip if no file context yet
+            if [ -z "$CURRENT_FILE" ] || [ "$NEW_LINE" -eq 0 ] 2>/dev/null; then
+              continue
+            fi
+            
+            # Process diff lines
+            case "$line" in
+              +*)
+                # Added line: exists in new file, part of diff
+                NEW_LINE=$((NEW_LINE + 1))
+                DIFF_MAP=$(echo "$DIFF_MAP" | jq --arg f "$CURRENT_FILE" --argjson l "$NEW_LINE" '.[$f] += [$l]')
+                ;;
+              -*)
+                # Removed line: does not exist in new file, skip incrementing
+                ;;
+              *)
+                # Context line: exists in new file but is unchanged - still valid for comments
+                NEW_LINE=$((NEW_LINE + 1))
+                DIFF_MAP=$(echo "$DIFF_MAP" | jq --arg f "$CURRENT_FILE" --argjson l "$NEW_LINE" '.[$f] += [$l]')
+                ;;
+            esac
+          done < diff.patch
+          
+          echo "$DIFF_MAP" > diff_map.json
+          
+          # Log summary
+          FILE_COUNT=$(echo "$DIFF_MAP" | jq 'keys | length')
+          TOTAL_LINES=$(echo "$DIFF_MAP" | jq '[.[] | length] | add // 0')
+          echo "Diff map: $FILE_COUNT files, $TOTAL_LINES commentable lines"
+
       - name: Parse table and create inline comments
         if: steps.files.outputs.has_files == 'true'
         env:
@@ -306,12 +366,15 @@ jobs:
           ${{ steps.gemini.outputs.REVIEW }}
           REVIEW_EOF
           
+          # Load the diff map for line validation
+          DIFF_MAP=$(cat diff_map.json)
+          
           # Robust parser for the occurrence table
           # Format: | ID | Category | Severity | File | Approx. line | Short description |
-          # Handles: leading/trailing spaces, backticks in cells, markdown formatting
           COMMENTS_JSON="[]"
           PARSED_COUNT=0
           SKIPPED_COUNT=0
+          ADJUSTED_COUNT=0
           
           while IFS= read -r line; do
             # Strip leading/trailing whitespace
@@ -341,29 +404,62 @@ jobs:
             LINE_NUM=$(echo "$line" | awk -F'|' '{gsub(/^[ \t`~]+|[ \t`~]+$/, "", $6); gsub(/[^0-9]/, "", $6); print $6}')
             DESC=$(echo "$line" | awk -F'|' '{gsub(/^[ \t`]+|[ \t`]+$/, "", $7); print $7}')
             
-            # Validate: file must exist in diff, line must be a number
-            if [ -n "$FILE" ] && [ -n "$LINE_NUM" ] && [ "$LINE_NUM" -gt 0 ] 2>/dev/null; then
-              BODY="**[$CATEGORY]** $SEVERITY: $DESC"
-              
-              # Add to JSON array using jq for safe escaping
-              COMMENTS_JSON=$(echo "$COMMENTS_JSON" | jq \
-                --arg path "$FILE" \
-                --argjson line "$LINE_NUM" \
-                --arg body "$BODY" \
-                '. += [{"path": $path, "line": $line, "body": $body}]')
-              
-              PARSED_COUNT=$((PARSED_COUNT + 1))
-              echo "  [$PARSED_COUNT] $FILE:$LINE_NUM ($SEVERITY) - $CATEGORY"
-            else
+            # Validate: file and line must be present
+            if [ -z "$FILE" ] || [ -z "$LINE_NUM" ] || ! [ "$LINE_NUM" -gt 0 ] 2>/dev/null; then
               SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               echo "  [SKIP] Could not parse row: $line"
+              continue
             fi
+            
+            # Check if file exists in the diff
+            FILE_IN_DIFF=$(echo "$DIFF_MAP" | jq --arg f "$FILE" 'has($f)')
+            if [ "$FILE_IN_DIFF" != "true" ]; then
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              echo "  [SKIP] File not in diff: $FILE"
+              continue
+            fi
+            
+            # Validate and adjust line number to nearest valid diff line
+            VALID_LINE=$(echo "$DIFF_MAP" | jq --arg f "$FILE" --argjson target "$LINE_NUM" '
+              .[$f] as $lines |
+              if ($lines | length) == 0 then null
+              elif ($lines | index($target)) then $target
+              else
+                # Find the closest valid line
+                $lines | map(. as $l | {line: $l, dist: (($l - $target) | if . < 0 then -. else . end)}) |
+                sort_by(.dist) | .[0].line
+              end
+            ')
+            
+            if [ "$VALID_LINE" = "null" ] || [ -z "$VALID_LINE" ]; then
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              echo "  [SKIP] No valid diff lines for $FILE:$LINE_NUM"
+              continue
+            fi
+            
+            # Log adjustment if line was changed
+            if [ "$VALID_LINE" != "$LINE_NUM" ]; then
+              ADJUSTED_COUNT=$((ADJUSTED_COUNT + 1))
+              echo "  [ADJUST] $FILE: line $LINE_NUM -> $VALID_LINE (nearest in diff)"
+            fi
+            
+            BODY="**[$CATEGORY]** $SEVERITY: $DESC"
+            
+            # Add to JSON array using jq for safe escaping
+            COMMENTS_JSON=$(echo "$COMMENTS_JSON" | jq \
+              --arg path "$FILE" \
+              --argjson line "$VALID_LINE" \
+              --arg body "$BODY" \
+              '. += [{"path": $path, "line": $line, "body": $body}]')
+            
+            PARSED_COUNT=$((PARSED_COUNT + 1))
+            echo "  [$PARSED_COUNT] $FILE:$VALID_LINE ($SEVERITY) - $CATEGORY"
           done < review_output.txt
           
           COMMENT_COUNT=$(echo "$COMMENTS_JSON" | jq 'length')
           echo ""
           echo "=== Parser Summary ==="
-          echo "Parsed: $PARSED_COUNT | Skipped: $SKIPPED_COUNT | Total comments: $COMMENT_COUNT"
+          echo "Parsed: $PARSED_COUNT | Adjusted: $ADJUSTED_COUNT | Skipped: $SKIPPED_COUNT | Total: $COMMENT_COUNT"
           
           if [ "$COMMENT_COUNT" -gt 0 ]; then
             PR_NUMBER=${{ github.event.pull_request.number }}
